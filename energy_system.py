@@ -1,3 +1,5 @@
+import random
+
 import numpy as np
 
 from parameters import *
@@ -85,24 +87,95 @@ class EnergySystem():
             self.pv_power_history = pv_power_prediction_history
             self.p_load_history = p_load_prediction_history
             self.wt_power_history = wt_prediction_power_history
-            self.fcv_h2_history = np.array(fcv_h2_prediction_m_history)/2
-
+            self.fcv_h2_history = np.array(fcv_h2_prediction_m_history)
+            self.ev_charge_history = ev_charge_predicted_history
         elif self.flag == 'test':
             self.pv_power_history = pv_power_reality_history
             self.p_load_history = p_load_reality_history
             self.wt_power_history= wt_reality_power_history
-            self.fcv_h2_history = fcv_h2_reality_m_history
-
+            self.fcv_h2_history = np.array(fcv_h2_prediction_m_history)/2
+            self.ev_charge_history = ev_charge_predicted_history
         self.reset()
     def step(self,action):
-        soc_bat,soc_h2,p_load, pv_power,wt_power,m_fcvs,pre_fc_power,pre_el_power = self.state
+        soc_bat,soc_h2,p_load, pv_power,wt_power,m_fcvs,pre_fc_power,pre_el_power,time_step = self.state
+
         #soc_bat = round(soc_bat,4)
         #soc_h2 = round(soc_h2,4)
         #action = action[0]
-
-        p_bat, p_FC,p_EL = action[0],action[1],action[2]
+        p_load = p_load * max(self.p_load_history)
+        pv_power = pv_power * max(self.pv_power_history)
+        wt_power = wt_power * max(self.wt_power_history)
+        m_fcvs  = m_fcvs * max(self.fcv_h2_history)
+        pre_fc_power = pre_fc_power*n_FC
+        pre_el_power = pre_el_power*n_EL
+        p_bat, p_FC, p_EL = action[0],action[1],action[2]
+        p_bat = battery_charge_power*p_bat
+        #p_FC = n_FC*(p_FC+1)/2
+        p_FC = 0
+        p_EL = n_EL*(p_EL+1)/2
         p_bat = min(soc_bat*c_bat,p_bat) if p_bat > 0 else p_bat # 考虑电池没有足够的电输出
         p_bat = max(-(1-soc_bat)*c_bat,p_bat) if p_bat<0 else p_bat # 考虑电池充满以后的情况
+        p_load = p_load
+        print("========================================================")
+        print("This is No.{} time step".format(self.time_step))
+        print("SOC of battery:{}    SOC of H2:{}".format(soc_bat,soc_h2))
+        print("bat_power:{}, fc_power:{}, el_power:{}".format(p_bat,p_FC,p_EL))
+        #p_EL = p_EL.clip(0,n_EL)
+        #p_FC = p_h2 if p_h2 > 0 else 0
+        #p_EL = abs(p_h2) if p_h2 < 0 else 0
+        self.el_power_history.append(p_EL)
+        self.fc_power_history.append(p_FC)
+
+        e_buy =-(pv_power + wt_power + p_FC + p_bat - p_EL - p_load-self.ev_charge_history[self.time_step])
+
+        print("e_buy:{}".format(e_buy))
+        pre_soc_bat = soc_bat
+        soc_bat = soc_bat - (eta_charge * p_bat * freq)/self.c_bat
+        soc_bat = round(soc_bat,4)
+        if soc_bat > 1:
+            soc_bat = 1
+        elif soc_bat < 0:
+            soc_bat = 0
+        soc_h2,delta_m= self.calculate_new_h2_soc(p_FC,p_EL,m_fcvs)
+        soc_h2 = round(soc_h2,4)
+        self.h2_soc_history.append(soc_h2)
+        new_p_load = self.p_load_history[self.time_step+1] if self.time_step!= 23 else self.p_load_history[0]
+        new_pv_power = self.pv_power_history[self.time_step+1] if self.time_step!= 23 else self.pv_power_history[0]
+        new_wt_power = self.wt_power_history[self.time_step+1] if self.time_step!=23 else self.wt_power_history[0]
+        new_m_fcvs = self.fcv_h2_history[self.time_step+1] if self.time_step != 23 else self.fcv_h2_history[0]
+        costs,real_carbon_cost,degrade_cost,sum_of_cost = calculate_cost(self.time_step,p_FC,pre_fc_power,p_EL,pre_el_power,p_bat,e_buy,pre_soc_bat,soc_bat,soc_h2,delta_m,m_fcvs)
+        pre_fc_power = p_FC
+        pre_el_power = p_EL
+        self.state = [soc_bat,soc_h2,new_p_load/max(self.p_load_history)
+            ,new_pv_power/max(self.pv_power_history),new_wt_power/max(self.wt_power_history),
+                      new_m_fcvs/max(self.fcv_h2_history),pre_fc_power/n_FC,pre_el_power/n_EL,self.time_step/23]
+        print(self.state)
+        print(costs)
+        self.time_step += 1
+        done = 1 if self.time_step == 24 else 0
+        self.pre_p_FC = p_FC
+        self.pre_p_EL = p_EL
+        return self.state,costs,done,real_carbon_cost,degrade_cost,sum_of_cost
+
+    def test_step(self,action):
+        soc_bat,soc_h2,p_load, pv_power,wt_power,m_fcvs,pre_fc_power,pre_el_power,time_step = self.state
+        #soc_bat = round(soc_bat,4)
+        #soc_h2 = round(soc_h2,4)
+        #action = action[0]
+        p_load = p_load * max(self.p_load_history)
+        pv_power = pv_power * max(self.pv_power_history)
+        wt_power = wt_power * max(self.wt_power_history)
+        m_fcvs  = m_fcvs * max(self.fcv_h2_history)
+        pre_fc_power = pre_fc_power*n_FC
+        pre_el_power = pre_el_power*n_EL
+        p_bat, p_FC, p_EL = action[0],action[1],action[2]
+        p_bat = battery_charge_power*p_bat
+        p_FC = n_FC*(p_FC+1)/2
+        p_FC = 0
+        p_EL = n_EL*(p_EL+1)/2
+        p_bat = min(soc_bat*c_bat,p_bat) if p_bat > 0 else p_bat # 考虑电池没有足够的电输出
+        p_bat = max(-(1-soc_bat)*c_bat,p_bat) if p_bat<0 else p_bat # 考虑电池充满以后的情况
+        p_load = p_load
         print("========================================================")
         print("This is No.{} time step".format(self.time_step))
         print("SOC of battery:{}    SOC of H2:{}".format(soc_bat,soc_h2))
@@ -117,34 +190,43 @@ class EnergySystem():
 
         print("e_buy:{}".format(e_buy))
         soc_bat = soc_bat - (eta_charge * p_bat * freq)/self.c_bat
+        soc_bat = round(soc_bat,4)
         if soc_bat > 1:
             soc_bat = 1
         elif soc_bat < 0:
             soc_bat = 0
         soc_h2,delta_m= self.calculate_new_h2_soc(p_FC,p_EL,m_fcvs)
+        soc_h2 = round(soc_h2,4)
         self.h2_soc_history.append(soc_h2)
         new_p_load = self.p_load_history[self.time_step+1] if self.time_step!= 23 else self.p_load_history[0]
         new_pv_power = self.pv_power_history[self.time_step+1] if self.time_step!= 23 else self.pv_power_history[0]
         new_wt_power = self.wt_power_history[self.time_step+1] if self.time_step!=23 else self.wt_power_history[0]
         new_m_fcvs = self.fcv_h2_history[self.time_step+1] if self.time_step != 23 else self.fcv_h2_history[0]
-        costs = calculate_cost(self.time_step,pv_power,wt_power,p_FC,pre_fc_power,p_EL,pre_el_power,p_bat,e_buy,soc_bat,soc_h2,delta_m,m_fcvs)
+        costs,real_carbon_cost,degrade_cost,sum_of_cost = calculate_cost(self.time_step,pv_power,wt_power,p_FC,pre_fc_power,p_EL,pre_el_power,p_bat,e_buy,soc_bat,soc_h2,delta_m,m_fcvs)
         pre_fc_power = p_FC
         pre_el_power = p_EL
-        self.state = [soc_bat,soc_h2,new_p_load,new_pv_power,new_wt_power,new_m_fcvs,pre_fc_power,pre_el_power]
+        self.state = [soc_bat,soc_h2,new_p_load/max(self.p_load_history)
+            ,new_pv_power/max(self.pv_power_history),new_wt_power/max(self.wt_power_history),
+                      new_m_fcvs/max(self.fcv_h2_history),pre_fc_power/n_FC,pre_el_power/n_EL,self.time_step/23]
         print(self.state)
         print(costs)
         self.time_step += 1
         done = 1 if self.time_step == 24 else 0
         self.pre_p_FC = p_FC
         self.pre_p_EL = p_EL
-        return self.state,costs,done
-
+        return self.state,costs,done,e_buy,real_carbon_cost,degrade_cost,sum_of_cost
+    def test_reset(self):
+        pass
     def reset(self):
         self.time_step = 0
-        initial_bat_soc = 0.5
-        initial_h2_soc = 0.5
+        initial_bat_soc = round(random.uniform(0.2,0.35),4)
+        initial_h2_soc = round(random.uniform(0.45,0.5),4)
+        #initial_bat_soc = 0.33
+        #initial_h2_soc = 0.34
         self.bat_soc_history = [initial_bat_soc]
         self.H2_soc_history = [initial_h2_soc]
+        #self.bat_soc_history = [0.3511]
+        #self.H2_soc_history = [0.45]
         initial_bat_power = 10
         initial_fc_power = 10
         initial_el_power = 100
@@ -154,9 +236,9 @@ class EnergySystem():
         self.cost_history = []
         self.h2_soc_history = []
         self.m = self.V_h2 / (self.b + self.R * self.T /( self.h2_pressure_max * (self.H2_soc_history[0])))
-        self.state = [self.bat_soc_history[0], self.H2_soc_history[0], self.p_load_history[0],
-                      self.pv_power_history[0], self.wt_power_history[0],
-                      self.fcv_h2_history[0],self.fc_power_history[-1],self.el_power_history[-1]]
+        self.state = [self.bat_soc_history[0], self.H2_soc_history[0], self.p_load_history[0]/max(self.p_load_history),
+                      self.pv_power_history[0]/max(self.pv_power_history), self.wt_power_history[0]/max(self.wt_power_history),
+                      self.fcv_h2_history[0]/max(self.fcv_h2_history),self.fc_power_history[-1]/n_FC,self.el_power_history[-1]/n_EL,self.time_step/23]
         return self.state
 
     def calculate_new_h2_soc(self,p_fc,p_el,m_fcvs):
